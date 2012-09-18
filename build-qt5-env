@@ -1,3 +1,4 @@
+THREADS="-j 4"
 QT_WEEKLY_REV=beta1
 WEEKLY_QT5_HASH="v5.0.0-beta1"
 QT5_MODULES="qtjsbackend qtxmlpatterns qtscript qtquick1 qtdeclarative qt3d qtsensors qtlocation"
