@@ -2,7 +2,10 @@
 
 usage() {
     echo -e "usage: $0 [-d <path to compile in> | -g | -b | -m] | [-h]\n\
--g : skip git fetch\n-b : skip compiling qt5 base\n-m : skip compilng qt modules" 
+-d <path> : set path of q5 build directory\n\
+-g : skip git fetch\n\
+-b : skip compiling qt5 base\n\
+-m : skip compilng qt modules" 
     exit 1
 }
 
@@ -32,12 +35,13 @@ if [ -z $QTDIR_PATH ]; then
     d=`dirname $PWD/$0`
     d=`dirname $d`
     d=`dirname $d`
-    QTDIR_PATH=$d/qt5
+    QTDIR_PATH=$d
     unset d
 fi
 
 . qt5-tools/build-qt5-env
 
+echo "QTDIR_PATH: $QTDIR_PATH"
 #QTDIR_PATH="/data/buildbot/qt5"
 
 d=`diff qt5-tools/build-qt5-env $QTDIR_PATH/newest_version 2>&1 | wc -l`
@@ -54,12 +58,12 @@ export QTDIR=$NEW_QTDIR
 export PATH=$QTDIR/bin:$PATH
 
 if [ -z $skip_git ]; then
-    rm -rf qt5
+    rm -rf $QTDIR_PATH/qt5
     #git clone git@gitorious.org:+qt-developers/qt/qt5.git || exit 1
     git clone git://gitorious.org/qt/qt5.git || exit 1
 fi
 
-cd qt5
+cd $QTDIR_PATH/qt5
 
 if [ -z $skip_git ]; then
     git submodule foreach "git clean -dxf" || exit 1
@@ -77,7 +81,7 @@ if [ -z $skip_git ]; then
 
     # Mips patch for qt3d
     cd qt3d
-    patch -p 1 < ../../qt5-tools/cross-tools/qt3d_assimp_mips_fix.diff
+    patch -p 1 < ../../qt5-tools/cross-tools/qt3d_assimp_mips_fix.diff || exit 1
     cd ..
 fi
 
