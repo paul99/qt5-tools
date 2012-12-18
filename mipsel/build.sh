@@ -11,7 +11,6 @@ compile() {
     mkdir qtbase/mkspecs/linux-mipsel-g++
     cp qtbase/mkspecs/linux-arm-gnueabi-g++/qplatformdefs.h qtbase/mkspecs/linux-mipsel-g++
     cp ../qt5-tools/$ARCH/qmake.conf qtbase/mkspecs/linux-mipsel-g++/
-    #git apply ../qt5-tools/cross-tools/qtjsbackend.patch --directory=qtjsbackend
 
     export PKG_CONFIG_LIBDIR=/usr/mipsel-linux-gnu/lib/pkgconfig
     if [ -z $skip_qtbase ]; then
@@ -25,7 +24,7 @@ compile() {
     fi
 
     if [ -z $skip_modules ]; then
-        for module in $QT5_MODULES
+        for module in $QT5_MODULES $NON_QT5_MODULES
         do
             cd $module && qmake && make $THREADS && make install && cd ..
             if [ $? -ne 0 ] ; then
