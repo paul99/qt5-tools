@@ -67,12 +67,13 @@ if [ -z $skip_git ]; then
     #rm -rf $QTDIR_PATH/qt5
     #git clone git@gitorious.org:+qt-developers/qt/qt5.git || exit 1
     #git clone git://gitorious.org/qt/qt5.git || exit 1
+    cd $QTDIR_PATH/qt5
     git checkout stable
     git clean -dxf
     git reset --hard HEAD
+else
+    cd $QTDIR_PATH/qt5
 fi
-
-cd $QTDIR_PATH/qt5
 
 if [ -z $skip_git ]; then
     git submodule foreach "git clean -dxf" || exit 1
