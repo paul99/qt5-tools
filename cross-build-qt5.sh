@@ -49,8 +49,6 @@ fi
 
 . qt5-tools/build-qt5-env
 
-echo "QTDIR_PATH: $QTDIR_PATH"
-
 d=`diff qt5-tools/build-qt5-env $QTDIR_PATH/newest_version 2>&1 | wc -l`
 if [ "$d" = "0" ]; then
   echo "The newest working version is already installed."
@@ -58,45 +56,63 @@ if [ "$d" = "0" ]; then
   exit 0
 fi
 
-NEW_QTDIR="$QTDIR_PATH/Qt-5.0.0-$QT_WEEKLY_REV"
+NEW_QTDIR="$QTDIR_PATH/$QT_WEEKLY_REV"
 
 export QTDIR=$NEW_QTDIR
 export PATH=$QTDIR/bin:$PATH
 
+MIRROR_URL="git://gitorious.org"
+
 if [ -z $skip_git ]; then
+    echo "removing: $NEW_QTDIR"
+    rm -rf $NEW_QTDIR
     #rm -rf $QTDIR_PATH/qt5
     #git clone git@gitorious.org:+qt-developers/qt/qt5.git || exit 1
     #git clone git://gitorious.org/qt/qt5.git || exit 1
-    cd $QTDIR_PATH/qt5
+    echo "cloning qtsdk..."
+    if [ ! -d qtsdk ]; then
+        git clone -b master $MIRROR_URL"/qtsdk/qtsdk.git" qtsdk || exit 1
+    fi
+
+    for module in $NON_QT5_MODULES; do
+        echo "cloning qtsdk module: $module ..."
+        if [ ! -d qtsdk/$module ]; then
+            module_branch="${module}_BRANCH"
+            git clone -b ${!module_branch} $MIRROR_URL"/qt/"$module".git" qtsdk/$module
+        fi
+    done
+fi
+
+echo "entering: $QTDIR_PATH/qtsdk"
+cd $QTDIR_PATH/qtsdk
+
+if [ -z $skip_git ]; then
+    echo "Setting up git"
     git checkout stable
     git clean -dxf
     git reset --hard HEAD
-else
-    cd $QTDIR_PATH/qt5
-fi
-
-if [ -z $skip_git ]; then
-    git submodule foreach "git clean -dxf" || exit 1
-    git submodule foreach "git checkout master" || exit 1
-    git submodule foreach "git reset --hard HEAD" || exit 1
+    git submodule foreach "git checkout stable"
+    git submodule foreach "git clean -dxf"
+    git submodule foreach "git reset --hard HEAD"
     git fetch || exit 1
     git reset --hard $WEEKLY_QT5_HASH || exit 1
     ./init-repository --module-subset=qtbase,`echo $QT5_MODULES | tr " " ","` -f || exit 1
     git submodule foreach "git fetch" || exit 1
     git submodule update --recursive || exit 1
+    echo ==========================================================
+    git submodule status
+    echo ==========================================================
 
-    for module in $NON_QT5_MODULES; do
+    for module in $NON_QT5_MODULES
+    do
         module_hash="${module}_HASH"
-        cd $module && git checkout master && git clean -dxf && git reset --hard HEAD && git fetch && git checkout ${!module_hash} && cd ..
+        module_branch="${module}_BRANCH"
+        cd $module && git checkout ${!module_branch} && git clean -dxf && git reset --hard HEAD && git fetch && git checkout ${!module_hash} && cd ..
         if [ $? -ne 0 ] ; then
             echo FAIL: updating $module
             exit 1
         fi
     done
-
-    echo ==========================================================
-    git submodule status
-    echo ==========================================================
 fi
 
 echo "sourcing $ARCH specific script file."
