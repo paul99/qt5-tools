@@ -1,10 +1,10 @@
 compile() {
-    echo "mipsel specific bulit script called, skip_qtbase: $skip_qtbase; skip_modules: $skip_modules"
+    echo "mipsel specific build script called, skip_qtbase: $skip_qtbase; skip_modules: $skip_modules"
 
     if [ -z $skip_git ]; then
-        # Mips patch for qt3d
-        cd qt3d
-        patch -p 1 < ../../qt5-tools/mipsel/qt3d_assimp_mips_fix.diff || exit 1
+        # Mips patch for qtjsbackend
+        cd qtjsbackend
+        patch -p 1 < ../../qt5-tools/mipsel/v8_mips.diff || exit 1
         cd ..
     fi
 
@@ -14,7 +14,7 @@ compile() {
 
     export PKG_CONFIG_LIBDIR=/usr/mipsel-linux-gnu/lib/pkgconfig
     if [ -z $skip_qtbase ]; then
-        ./configure -arch mipsel -xplatform linux-mipsel-g++ -opensource -confirm-license -no-pch -nomake examples -nomake demos -nomake tests -no-gtkstyle -nomake translations -qt-zlib -qt-libpng -qt-libjpeg -qt-sql-sqlite -release -prefix $QTDIR -v -I /usr/mipsel-linux-gnu/include/dbus-1.0 -force-pkg-config
+        ./configure -arch mipsel -xplatform linux-mipsel-g++ -opensource -confirm-license -no-pch -nomake examples -nomake tests -no-gtkstyle -qt-zlib -qt-libpng -qt-libjpeg -qt-sql-sqlite -release -prefix $QTDIR -v -I /usr/mipsel-linux-gnu/include/dbus-1.0 -force-pkg-config
 
         cd qtbase && make $THREADS && make install && cd ..
         if [ $? -ne 0 ] ; then
@@ -24,8 +24,7 @@ compile() {
     fi
 
     if [ -z $skip_modules ]; then
-        for module in $QT5_MODULES $NON_QT5_MODULES
-        do
+        for module in $QT5_MODULES; do
             cd $module && qmake && make $THREADS && make install && cd ..
             if [ $? -ne 0 ] ; then
                 echo FAIL: building $module.

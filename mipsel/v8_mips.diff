@@ -1,0 +1,1464 @@
+diff --git a/src/3rdparty/v8/src/mips/assembler-mips-inl.h b/src/3rdparty/v8/src/mips/assembler-mips-inl.h
+index 3e726a7..3b300f5 100644
+--- a/src/3rdparty/v8/src/mips/assembler-mips-inl.h
++++ b/src/3rdparty/v8/src/mips/assembler-mips-inl.h
+@@ -231,6 +231,24 @@ void RelocInfo::set_target_cell(JSGlobalPropertyCell* cell,
+ }
+ 
+ 
++static const int kNoCodeAgeSequenceLength = 7;
++
++Code* RelocInfo::code_age_stub() {
++  ASSERT(rmode_ == RelocInfo::CODE_AGE_SEQUENCE);
++  return Code::GetCodeFromTargetAddress(
++      Memory::Address_at(pc_ + Assembler::kInstrSize *
++                         (kNoCodeAgeSequenceLength - 1)));
++}
++
++
++void RelocInfo::set_code_age_stub(Code* stub) {
++  ASSERT(rmode_ == RelocInfo::CODE_AGE_SEQUENCE);
++  Memory::Address_at(pc_ + Assembler::kInstrSize *
++                     (kNoCodeAgeSequenceLength - 1)) =
++      stub->instruction_start();
++}
++
++
+ Address RelocInfo::call_address() {
+   ASSERT((IsJSReturn(rmode()) && IsPatchedReturnSequence()) ||
+          (IsDebugBreakSlot(rmode()) && IsPatchedDebugBreakSlotSequence()));
+@@ -302,6 +320,8 @@ void RelocInfo::Visit(ObjectVisitor* visitor) {
+     visitor->VisitGlobalPropertyCell(this);
+   } else if (mode == RelocInfo::EXTERNAL_REFERENCE) {
+     visitor->VisitExternalReference(this);
++  } else if (RelocInfo::IsCodeAgeSequence(mode)) {
++    visitor->VisitCodeAgeSequence(this);
+ #ifdef ENABLE_DEBUGGER_SUPPORT
+   // TODO(isolates): Get a cached isolate below.
+   } else if (((RelocInfo::IsJSReturn(mode) &&
+@@ -328,6 +348,8 @@ void RelocInfo::Visit(Heap* heap) {
+     StaticVisitor::VisitGlobalPropertyCell(heap, this);
+   } else if (mode == RelocInfo::EXTERNAL_REFERENCE) {
+     StaticVisitor::VisitExternalReference(this);
++  } else if (RelocInfo::IsCodeAgeSequence(mode)) {
++    StaticVisitor::VisitCodeAgeSequence(heap, this);
+ #ifdef ENABLE_DEBUGGER_SUPPORT
+   } else if (heap->isolate()->debug()->has_break_points() &&
+              ((RelocInfo::IsJSReturn(mode) &&
+diff --git a/src/3rdparty/v8/src/mips/assembler-mips.cc b/src/3rdparty/v8/src/mips/assembler-mips.cc
+index 4ce924d..a4563a6 100644
+--- a/src/3rdparty/v8/src/mips/assembler-mips.cc
++++ b/src/3rdparty/v8/src/mips/assembler-mips.cc
+@@ -274,7 +274,8 @@ static const int kMinimalBufferSize = 4 * KB;
+ Assembler::Assembler(Isolate* arg_isolate, void* buffer, int buffer_size)
+     : AssemblerBase(arg_isolate),
+       recorded_ast_id_(TypeFeedbackId::None()),
+-      positions_recorder_(this) {
++      positions_recorder_(this),
++      emit_debug_code_(FLAG_debug_code) {
+   if (buffer == NULL) {
+     // Do our own buffer management.
+     if (buffer_size <= kMinimalBufferSize) {
+diff --git a/src/3rdparty/v8/src/mips/assembler-mips.h b/src/3rdparty/v8/src/mips/assembler-mips.h
+index fd2ff0d..fad71df 100644
+--- a/src/3rdparty/v8/src/mips/assembler-mips.h
++++ b/src/3rdparty/v8/src/mips/assembler-mips.h
+@@ -525,6 +525,9 @@ class Assembler : public AssemblerBase {
+   Assembler(Isolate* isolate, void* buffer, int buffer_size);
+   ~Assembler();
+ 
++  // Overrides the default provided by FLAG_debug_code.
++  void set_emit_debug_code(bool value) { emit_debug_code_ = value; }
++
+   // GetCode emits any pending (non-emitted) code and fills the descriptor
+   // desc. GetCode() is idempotent; it returns the same result if no other
+   // Assembler functions are invoked in between GetCode() calls.
+@@ -663,7 +666,9 @@ class Assembler : public AssemblerBase {
+     PROPERTY_ACCESS_INLINED_CONTEXT_DONT_DELETE,
+     // Helper values.
+     LAST_CODE_MARKER,
+-    FIRST_IC_MARKER = PROPERTY_ACCESS_INLINED
++    FIRST_IC_MARKER = PROPERTY_ACCESS_INLINED,
++    // Code aging
++    CODE_AGE_MARKER_NOP = 6
+   };
+ 
+   // Type == 0 is the default non-marking nop. For mips this is a
+@@ -1027,6 +1032,8 @@ class Assembler : public AssemblerBase {
+   // the relocation info.
+   TypeFeedbackId recorded_ast_id_;
+ 
++  bool emit_debug_code() const { return emit_debug_code_; }
++
+   int32_t buffer_space() const { return reloc_info_writer.pos() - pc_; }
+ 
+   // Decode branch instruction at pos and return branch target pos.
+@@ -1277,6 +1284,7 @@ class Assembler : public AssemblerBase {
+   friend class BlockTrampolinePoolScope;
+ 
+   PositionsRecorder positions_recorder_;
++  bool emit_debug_code_;
+   friend class PositionsRecorder;
+   friend class EnsureSpace;
+ };
+diff --git a/src/3rdparty/v8/src/mips/builtins-mips.cc b/src/3rdparty/v8/src/mips/builtins-mips.cc
+index 0342e65..b2348fc 100644
+--- a/src/3rdparty/v8/src/mips/builtins-mips.cc
++++ b/src/3rdparty/v8/src/mips/builtins-mips.cc
+@@ -1255,6 +1255,48 @@ void Builtins::Generate_LazyRecompile(MacroAssembler* masm) {
+ }
+ 
+ 
++static void GenerateMakeCodeYoungAgainCommon(MacroAssembler* masm) {
++  // For now, we are relying on the fact that make_code_young doesn't do any
++  // garbage collection which allows us to save/restore the registers without
++  // worrying about which of them contain pointers. We also don't build an
++  // internal frame to make the code faster, since we shouldn't have to do stack
++  // crawls in MakeCodeYoung. This seems a bit fragile.
++
++  __ mov(a0, ra);
++  // Adjust a0 to point to the head of the PlatformCodeAge sequence
++  __ Subu(a0, a0,
++      Operand((kNoCodeAgeSequenceLength - 1) * Assembler::kInstrSize));
++  // Restore the original return address of the function
++  __ mov(ra, at);
++
++  // The following registers must be saved and restored when calling through to
++  // the runtime:
++  //   a0 - contains return address (beginning of patch sequence)
++  //   a1 - function object
++  RegList saved_regs =
++      (a0.bit() | a1.bit() | ra.bit() | fp.bit()) & ~sp.bit();
++  FrameScope scope(masm, StackFrame::MANUAL);
++  __ MultiPush(saved_regs);
++  __ PrepareCallCFunction(1, 0, a1);
++  __ CallCFunction(
++      ExternalReference::get_make_code_young_function(masm->isolate()), 1);
++  __ MultiPop(saved_regs);
++  __ Jump(a0);
++}
++
++#define DEFINE_CODE_AGE_BUILTIN_GENERATOR(C)                 \
++void Builtins::Generate_Make##C##CodeYoungAgainEvenMarking(  \
++    MacroAssembler* masm) {                                  \
++  GenerateMakeCodeYoungAgainCommon(masm);                    \
++}                                                            \
++void Builtins::Generate_Make##C##CodeYoungAgainOddMarking(   \
++    MacroAssembler* masm) {                                  \
++  GenerateMakeCodeYoungAgainCommon(masm);                    \
++}
++CODE_AGE_LIST(DEFINE_CODE_AGE_BUILTIN_GENERATOR)
++#undef DEFINE_CODE_AGE_BUILTIN_GENERATOR
++
++
+ static void Generate_NotifyDeoptimizedHelper(MacroAssembler* masm,
+                                              Deoptimizer::BailoutType type) {
+   {
+diff --git a/src/3rdparty/v8/src/mips/code-stubs-mips.cc b/src/3rdparty/v8/src/mips/code-stubs-mips.cc
+index b1fe4d5..0560681 100644
+--- a/src/3rdparty/v8/src/mips/code-stubs-mips.cc
++++ b/src/3rdparty/v8/src/mips/code-stubs-mips.cc
+@@ -251,11 +251,6 @@ void FastNewContextStub::Generate(MacroAssembler* masm) {
+   __ sw(a1, MemOperand(v0, Context::SlotOffset(Context::EXTENSION_INDEX)));
+   __ sw(a2, MemOperand(v0, Context::SlotOffset(Context::GLOBAL_OBJECT_INDEX)));
+ 
+-  // Copy the qml global object from the surrounding context.
+-  __ lw(a1, MemOperand(cp, Context::SlotOffset(Context::QML_GLOBAL_OBJECT_INDEX)));
+-  __ sw(a1, MemOperand(v0, Context::SlotOffset(Context::QML_GLOBAL_OBJECT_INDEX)));
+-
+-
+   // Initialize the rest of the slots to undefined.
+   __ LoadRoot(a1, Heap::kUndefinedValueRootIndex);
+   for (int i = Context::MIN_CONTEXT_SLOTS; i < length; i++) {
+@@ -318,10 +313,6 @@ void FastNewBlockContextStub::Generate(MacroAssembler* masm) {
+   __ sw(a1, ContextOperand(v0, Context::EXTENSION_INDEX));
+   __ sw(a2, ContextOperand(v0, Context::GLOBAL_OBJECT_INDEX));
+ 
+-  // Copy the qml global object from the surrounding context.
+-  __ lw(a1, ContextOperand(cp, Context::QML_GLOBAL_OBJECT_INDEX));
+-  __ sw(a1, ContextOperand(v0, Context::QML_GLOBAL_OBJECT_INDEX));
+-
+   // Initialize the rest of the slots to the hole value.
+   __ LoadRoot(a1, Heap::kTheHoleValueRootIndex);
+   for (int i = 0; i < slots_; i++) {
+@@ -844,6 +835,7 @@ void FloatingPointHelper::LoadNumberAsInt32Double(MacroAssembler* masm,
+                                                   Register object,
+                                                   Destination destination,
+                                                   DoubleRegister double_dst,
++                                                  DoubleRegister double_scratch,
+                                                   Register dst1,
+                                                   Register dst2,
+                                                   Register heap_number_map,
+@@ -879,9 +871,10 @@ void FloatingPointHelper::LoadNumberAsInt32Double(MacroAssembler* masm,
+ 
+     Register except_flag = scratch2;
+     __ EmitFPUTruncate(kRoundToZero,
+-                       single_scratch,
+-                       double_dst,
+                        scratch1,
++                       double_dst,
++                       at,
++                       double_scratch,
+                        except_flag,
+                        kCheckForInexactConversion);
+ 
+@@ -923,7 +916,8 @@ void FloatingPointHelper::LoadNumberAsInt32(MacroAssembler* masm,
+                                             Register scratch1,
+                                             Register scratch2,
+                                             Register scratch3,
+-                                            DoubleRegister double_scratch,
++                                            DoubleRegister double_scratch0,
++                                            DoubleRegister double_scratch1,
+                                             Label* not_int32) {
+   ASSERT(!dst.is(object));
+   ASSERT(!scratch1.is(object) && !scratch2.is(object) && !scratch3.is(object));
+@@ -945,22 +939,19 @@ void FloatingPointHelper::LoadNumberAsInt32(MacroAssembler* masm,
+   if (CpuFeatures::IsSupported(FPU)) {
+     CpuFeatures::Scope scope(FPU);
+     // Load the double value.
+-    __ ldc1(double_scratch, FieldMemOperand(object, HeapNumber::kValueOffset));
++    __ ldc1(double_scratch0, FieldMemOperand(object, HeapNumber::kValueOffset));
+ 
+-    FPURegister single_scratch = double_scratch.low();
+     Register except_flag = scratch2;
+     __ EmitFPUTruncate(kRoundToZero,
+-                       single_scratch,
+-                       double_scratch,
++                       dst,
++                       double_scratch0,
+                        scratch1,
++                       double_scratch1,
+                        except_flag,
+                        kCheckForInexactConversion);
+ 
+     // Jump to not_int32 if the operation did not succeed.
+     __ Branch(not_int32, ne, except_flag, Operand(zero_reg));
+-    // Get the result in the destination register.
+-    __ mfc1(dst, single_scratch);
+-
+   } else {
+     // Load the double value in the destination registers.
+     __ lw(scratch2, FieldMemOperand(object, HeapNumber::kExponentOffset));
+@@ -1788,46 +1779,6 @@ void CompareStub::Generate(MacroAssembler* masm) {
+ 
+   // NOTICE! This code is only reached after a smi-fast-case check, so
+   // it is certain that at least one operand isn't a smi.
+-  {
+-    // This is optimized for reading the code and not benchmarked for
+-    // speed or amount of instructions. The code is not ordered for speed
+-    // or anything like this
+-    Label miss, user_compare;
+-
+-    // No global compare if both operands are SMIs
+-    __ And(a2, a1, Operand(a0));
+-    __ JumpIfSmi(a2, &miss);
+-
+-
+-    // We need to check if lhs and rhs are both objects, if not we are
+-    // jumping out of the function. We will keep the 'map' in t0 (lhs) and
+-    // t1 (rhs) for later usage.
+-    __ GetObjectType(a0, t0, a3);
+-    __ Branch(&miss, ne, a3, Operand(JS_OBJECT_TYPE));
+-
+-    __ GetObjectType(a1, t1, a3);
+-    __ Branch(&miss, ne, a3, Operand(JS_OBJECT_TYPE));
+-
+-    // Check if the UseUserComparison flag is set by using the map of t0 for lhs
+-    __ lbu(t0, FieldMemOperand(t0, Map::kBitField2Offset));
+-    __ And(t0, t0, Operand(1 << Map::kUseUserObjectComparison));
+-    __ Branch(&user_compare, eq, t0, Operand(1 << Map::kUseUserObjectComparison));
+-
+-
+-    // Check if the UseUserComparison flag is _not_ set by using the map of t1 for
+-    // rhs and then jump to the miss label.
+-    __ lbu(t1, FieldMemOperand(t1, Map::kBitField2Offset));
+-    __ And(t1, t1, Operand(1 << Map::kUseUserObjectComparison));
+-    __ Branch(&miss, ne, t1, Operand(1 << Map::kUseUserObjectComparison));
+-
+-    // Invoke the runtime function here
+-    __ bind(&user_compare);
+-    __ Push(a0, a1);
+-    __ TailCallRuntime(Runtime::kUserObjectEquals, 2, 1);
+-
+-    // We exit here without doing anything
+-    __ bind(&miss);
+-  }
+ 
+   // Handle the case where the objects are identical.  Either returns the answer
+   // or goes to slow.  Only falls through if the objects were not identical.
+@@ -3003,6 +2954,7 @@ void BinaryOpStub::GenerateInt32Stub(MacroAssembler* masm) {
+                                                    right,
+                                                    destination,
+                                                    f14,
++                                                   f16,
+                                                    a2,
+                                                    a3,
+                                                    heap_number_map,
+@@ -3014,6 +2966,7 @@ void BinaryOpStub::GenerateInt32Stub(MacroAssembler* masm) {
+                                                    left,
+                                                    destination,
+                                                    f12,
++                                                   f16,
+                                                    t0,
+                                                    t1,
+                                                    heap_number_map,
+@@ -3050,9 +3003,10 @@ void BinaryOpStub::GenerateInt32Stub(MacroAssembler* masm) {
+ 
+           Register except_flag = scratch2;
+           __ EmitFPUTruncate(kRoundToZero,
+-                             single_scratch,
+-                             f10,
+                              scratch1,
++                             f10,
++                             at,
++                             f16,
+                              except_flag);
+ 
+           if (result_type_ <= BinaryOpIC::INT32) {
+@@ -3061,7 +3015,6 @@ void BinaryOpStub::GenerateInt32Stub(MacroAssembler* masm) {
+           }
+ 
+           // Check if the result fits in a smi.
+-          __ mfc1(scratch1, single_scratch);
+           __ Addu(scratch2, scratch1, Operand(0x40000000));
+           // If not try to return a heap number.
+           __ Branch(&return_heap_number, lt, scratch2, Operand(zero_reg));
+@@ -3154,6 +3107,7 @@ void BinaryOpStub::GenerateInt32Stub(MacroAssembler* masm) {
+                                              scratch2,
+                                              scratch3,
+                                              f0,
++                                             f2,
+                                              &transition);
+       FloatingPointHelper::LoadNumberAsInt32(masm,
+                                              right,
+@@ -3163,6 +3117,7 @@ void BinaryOpStub::GenerateInt32Stub(MacroAssembler* masm) {
+                                              scratch2,
+                                              scratch3,
+                                              f0,
++                                             f2,
+                                              &transition);
+ 
+       // The ECMA-262 standard specifies that, for shift operations, only the
+@@ -3757,9 +3712,10 @@ void MathPowStub::Generate(MacroAssembler* masm) {
+     Label int_exponent_convert;
+     // Detect integer exponents stored as double.
+     __ EmitFPUTruncate(kRoundToMinusInf,
+-                       single_scratch,
+-                       double_exponent,
+                        scratch,
++                       double_exponent,
++                       at,
++                       double_scratch,
+                        scratch2,
+                        kCheckForInexactConversion);
+     // scratch2 == 0 means there was no conversion error.
+@@ -3817,7 +3773,7 @@ void MathPowStub::Generate(MacroAssembler* masm) {
+     __ push(ra);
+     {
+       AllowExternalCallThatCantCauseGC scope(masm);
+-      __ PrepareCallCFunction(0, 2, scratch);
++      __ PrepareCallCFunction(0, 2, scratch2);
+       __ SetCallCDoubleArguments(double_base, double_exponent);
+       __ CallCFunction(
+           ExternalReference::power_double_double_function(masm->isolate()),
+@@ -3828,7 +3784,6 @@ void MathPowStub::Generate(MacroAssembler* masm) {
+     __ jmp(&done);
+ 
+     __ bind(&int_exponent_convert);
+-    __ mfc1(scratch, single_scratch);
+   }
+ 
+   // Calculate power with integer exponent.
+@@ -7100,20 +7055,10 @@ void ICCompareStub::GenerateObjects(MacroAssembler* masm) {
+   __ And(a2, a1, Operand(a0));
+   __ JumpIfSmi(a2, &miss);
+ 
+-  // Compare lhs, a2 holds the map, a3 holds the type_reg
+-  __ GetObjectType(a0, a2, a3);
+-  __ Branch(&miss, ne, a3, Operand(JS_OBJECT_TYPE));
+-  __ lbu(a2, FieldMemOperand(a2, Map::kBitField2Offset));
+-  __ And(a2, a2, Operand(1 << Map::kUseUserObjectComparison));
+-  __ Branch(&miss, eq, a2, Operand(1 << Map::kUseUserObjectComparison));
+-
+-
+-  // Compare rhs, a2 holds the map, a3 holds the type_reg
+-  __ GetObjectType(a1, a2, a3);
+-  __ Branch(&miss, ne, a3, Operand(JS_OBJECT_TYPE));
+-  __ lbu(a2, FieldMemOperand(a2, Map::kBitField2Offset));
+-  __ And(a2, a2, Operand(1 << Map::kUseUserObjectComparison));
+-  __ Branch(&miss, eq, a2, Operand(1 << Map::kUseUserObjectComparison));
++  __ GetObjectType(a0, a2, a2);
++  __ Branch(&miss, ne, a2, Operand(JS_OBJECT_TYPE));
++  __ GetObjectType(a1, a2, a2);
++  __ Branch(&miss, ne, a2, Operand(JS_OBJECT_TYPE));
+ 
+   ASSERT(GetCondition() == eq);
+   __ Ret(USE_DELAY_SLOT);
+@@ -7130,18 +7075,8 @@ void ICCompareStub::GenerateKnownObjects(MacroAssembler* masm) {
+   __ JumpIfSmi(a2, &miss);
+   __ lw(a2, FieldMemOperand(a0, HeapObject::kMapOffset));
+   __ lw(a3, FieldMemOperand(a1, HeapObject::kMapOffset));
+-
+-  // Check object in a0
+   __ Branch(&miss, ne, a2, Operand(known_map_));
+-  __ lbu(a2, FieldMemOperand(a2, Map::kBitField2Offset));
+-  __ And(a2, a2, Operand(1 << Map::kUseUserObjectComparison));
+-  __ Branch(&miss, eq, a2, Operand(1 << Map::kUseUserObjectComparison));
+-
+-  // Check object in a1
+   __ Branch(&miss, ne, a3, Operand(known_map_));
+-  __ lbu(a3, FieldMemOperand(a3, Map::kBitField2Offset));
+-  __ And(a3, a3, Operand(1 << Map::kUseUserObjectComparison));
+-  __ Branch(&miss, eq, a3, Operand(1 << Map::kUseUserObjectComparison));
+ 
+   __ Ret(USE_DELAY_SLOT);
+   __ subu(v0, a0, a1);
+diff --git a/src/3rdparty/v8/src/mips/code-stubs-mips.h b/src/3rdparty/v8/src/mips/code-stubs-mips.h
+index e0954d8..840cd61 100644
+--- a/src/3rdparty/v8/src/mips/code-stubs-mips.h
++++ b/src/3rdparty/v8/src/mips/code-stubs-mips.h
+@@ -773,6 +773,7 @@ class FloatingPointHelper : public AllStatic {
+                                       Register object,
+                                       Destination destination,
+                                       FPURegister double_dst,
++                                      FPURegister double_scratch,
+                                       Register dst1,
+                                       Register dst2,
+                                       Register heap_number_map,
+@@ -794,7 +795,8 @@ class FloatingPointHelper : public AllStatic {
+                                 Register scratch1,
+                                 Register scratch2,
+                                 Register scratch3,
+-                                FPURegister double_scratch,
++                                FPURegister double_scratch0,
++                                FPURegister double_scratch1,
+                                 Label* not_int32);
+ 
+   // Generate non FPU code to check if a double can be exactly represented by a
+diff --git a/src/3rdparty/v8/src/mips/codegen-mips.cc b/src/3rdparty/v8/src/mips/codegen-mips.cc
+index 44e0359..f4ace1e 100644
+--- a/src/3rdparty/v8/src/mips/codegen-mips.cc
++++ b/src/3rdparty/v8/src/mips/codegen-mips.cc
+@@ -446,6 +446,100 @@ void StringCharLoadGenerator::Generate(MacroAssembler* masm,
+   __ bind(&done);
+ }
+ 
++// nop(CODE_AGE_MARKER_NOP)
++static const uint32_t kCodeAgePatchFirstInstruction = 0x00010180;
++
++static byte* GetNoCodeAgeSequence(uint32_t* length) {
++  // The sequence of instructions that is patched out for aging code is the
++  // following boilerplate stack-building prologue that is found in FUNCTIONS
++  static bool initialized = false;
++  static uint32_t sequence[kNoCodeAgeSequenceLength];
++  byte* byte_sequence = reinterpret_cast<byte*>(sequence);
++  *length = kNoCodeAgeSequenceLength * Assembler::kInstrSize;
++  if (!initialized) {
++    CodePatcher patcher(byte_sequence, kNoCodeAgeSequenceLength);
++    patcher.masm()->Push(ra, fp, cp, a1);
++    patcher.masm()->LoadRoot(at, Heap::kUndefinedValueRootIndex);
++    patcher.masm()->Addu(fp, sp, Operand(2 * kPointerSize));
++    initialized = true;
++  }
++  return byte_sequence;
++}
++
++
++byte* Code::FindPlatformCodeAgeSequence() {
++  byte* start = instruction_start();
++  uint32_t young_length;
++  byte* young_sequence = GetNoCodeAgeSequence(&young_length);
++  if (!memcmp(start, young_sequence, young_length) ||
++      Memory::uint32_at(start) == kCodeAgePatchFirstInstruction) {
++    return start;
++  } else {
++    byte* start_after_strict = NULL;
++    if (kind() == FUNCTION) {
++      start_after_strict = start + kSizeOfFullCodegenStrictModePrologue;
++    } else {
++      ASSERT(kind() == OPTIMIZED_FUNCTION);
++      start_after_strict = start + kSizeOfOptimizedStrictModePrologue;
++    }
++    ASSERT(!memcmp(start_after_strict, young_sequence, young_length) ||
++           Memory::uint32_at(start_after_strict) ==
++           kCodeAgePatchFirstInstruction);
++    return start_after_strict;
++  }
++}
++
++
++bool Code::IsYoungSequence(byte* sequence) {
++  uint32_t young_length;
++  byte* young_sequence = GetNoCodeAgeSequence(&young_length);
++  bool result = !memcmp(sequence, young_sequence, young_length);
++  ASSERT(result ||
++         Memory::uint32_at(sequence) == kCodeAgePatchFirstInstruction);
++  return result;
++}
++
++
++void Code::GetCodeAgeAndParity(byte* sequence, Age* age,
++                               MarkingParity* parity) {
++  if (IsYoungSequence(sequence)) {
++    *age = kNoAge;
++    *parity = NO_MARKING_PARITY;
++  } else {
++    Address target_address = Memory::Address_at(
++        sequence + Assembler::kInstrSize * (kNoCodeAgeSequenceLength - 1));
++    Code* stub = GetCodeFromTargetAddress(target_address);
++    GetCodeAgeAndParity(stub, age, parity);
++  }
++}
++
++
++void Code::PatchPlatformCodeAge(byte* sequence,
++                                Code::Age age,
++                                MarkingParity parity) {
++  uint32_t young_length;
++  byte* young_sequence = GetNoCodeAgeSequence(&young_length);
++  if (age == kNoAge) {
++    memcpy(sequence, young_sequence, young_length);
++    CPU::FlushICache(sequence, young_length);
++  } else {
++    Code* stub = GetCodeAgeStub(age, parity);
++    CodePatcher patcher(sequence, young_length / Assembler::kInstrSize);
++    // Mark this code sequence for FindPlatformCodeAgeSequence()
++    patcher.masm()->nop(Assembler::CODE_AGE_MARKER_NOP);
++    // Save the function's original return address
++    // (it will be clobbered by Call(t9))
++    patcher.masm()->mov(at, ra);
++    // Load the stub address to t9 and call it
++    patcher.masm()->li(t9,
++        Operand(reinterpret_cast<uint32_t>(stub->instruction_start())));
++    patcher.masm()->Call(t9);
++    // Record the stub address in the empty space for GetCodeAgeAndParity()
++    patcher.masm()->dd(reinterpret_cast<uint32_t>(stub->instruction_start()));
++  }
++}
++
++
+ #undef __
+ 
+ } }  // namespace v8::internal
+diff --git a/src/3rdparty/v8/src/mips/codegen-mips.h b/src/3rdparty/v8/src/mips/codegen-mips.h
+index e704c4f..27c8a8b 100644
+--- a/src/3rdparty/v8/src/mips/codegen-mips.h
++++ b/src/3rdparty/v8/src/mips/codegen-mips.h
+@@ -36,6 +36,9 @@
+ namespace v8 {
+ namespace internal {
+ 
++static const int kSizeOfFullCodegenStrictModePrologue = 16;
++static const int kSizeOfOptimizedStrictModePrologue = 16;
++
+ // Forward declarations
+ class CompilationInfo;
+ 
+diff --git a/src/3rdparty/v8/src/mips/full-codegen-mips.cc b/src/3rdparty/v8/src/mips/full-codegen-mips.cc
+index 46c9ecb..56c4335 100644
+--- a/src/3rdparty/v8/src/mips/full-codegen-mips.cc
++++ b/src/3rdparty/v8/src/mips/full-codegen-mips.cc
+@@ -158,11 +158,14 @@ void FullCodeGenerator::Generate() {
+   // function calls.
+   if (!info->is_classic_mode() || info->is_native()) {
+     Label ok;
++    Label begin;
++    __ bind(&begin);
+     __ Branch(&ok, eq, t1, Operand(zero_reg));
+     int receiver_offset = info->scope()->num_parameters() * kPointerSize;
+     __ LoadRoot(a2, Heap::kUndefinedValueRootIndex);
+     __ sw(a2, MemOperand(sp, receiver_offset));
+     __ bind(&ok);
++    ASSERT_EQ(kSizeOfFullCodegenStrictModePrologue, ok.pos() - begin.pos());
+   }
+ 
+   // Open a frame scope to indicate that there is a frame on the stack.  The
+@@ -172,12 +175,12 @@ void FullCodeGenerator::Generate() {
+ 
+   int locals_count = info->scope()->num_stack_slots();
+ 
++  // The following three instructions must remain together and unmodified for
++  // code aging to work properly.
+   __ Push(ra, fp, cp, a1);
+-  if (locals_count > 0) {
+-    // Load undefined value here, so the value is ready for the loop
+-    // below.
+-    __ LoadRoot(at, Heap::kUndefinedValueRootIndex);
+-  }
++  // Load undefined value here, so the value is ready for the loop
++  // below.
++  __ LoadRoot(at, Heap::kUndefinedValueRootIndex);
+   // Adjust fp to point to caller's fp.
+   __ Addu(fp, sp, Operand(2 * kPointerSize));
+ 
+@@ -191,8 +194,7 @@ void FullCodeGenerator::Generate() {
+ 
+   // Possibly allocate a local context.
+   int heap_slots = info->scope()->num_heap_slots() - Context::MIN_CONTEXT_SLOTS;
+-  if (heap_slots > 0 ||
+-      (scope()->is_qml_mode() && scope()->is_global_scope())) {
++  if (heap_slots > 0) {
+     Comment cmnt(masm_, "[ Allocate context");
+     // Argument to NewContext is the function, which is still in a1.
+     __ push(a1);
+@@ -200,7 +202,7 @@ void FullCodeGenerator::Generate() {
+       __ Push(info->scope()->GetScopeInfo());
+       __ CallRuntime(Runtime::kNewGlobalContext, 2);
+     } else if (heap_slots <= FastNewContextStub::kMaximumSlots) {
+-      FastNewContextStub stub((heap_slots < 0) ? 0 : heap_slots);
++      FastNewContextStub stub(heap_slots);
+       __ CallStub(&stub);
+     } else {
+       __ CallRuntime(Runtime::kNewFunctionContext, 1);
+@@ -824,7 +826,6 @@ void FullCodeGenerator::VisitVariableDeclaration(
+                         ? isolate()->factory()->the_hole_value()
+                         : isolate()->factory()->undefined_value(),
+                     zone());
+-      globals_->Add(isolate()->factory()->ToBoolean(variable->is_qml_global()), zone());
+       break;
+ 
+     case Variable::PARAMETER:
+@@ -886,7 +887,6 @@ void FullCodeGenerator::VisitFunctionDeclaration(
+       // Check for stack-overflow exception.
+       if (function.is_null()) return SetStackOverflow();
+       globals_->Add(function, zone());
+-      globals_->Add(isolate()->factory()->ToBoolean(variable->is_qml_global()), zone());
+       break;
+     }
+ 
+@@ -942,7 +942,6 @@ void FullCodeGenerator::VisitModuleDeclaration(ModuleDeclaration* declaration) {
+       Comment cmnt(masm_, "[ ModuleDeclaration");
+       globals_->Add(variable->name(), zone());
+       globals_->Add(instance, zone());
+-      globals_->Add(isolate()->factory()->ToBoolean(variable->is_qml_global()), zone());
+       Visit(declaration->module());
+       break;
+     }
+@@ -1348,7 +1347,7 @@ void FullCodeGenerator::EmitLoadGlobalCheckExtensions(Variable* var,
+     __ bind(&fast);
+   }
+ 
+-  __ lw(a0, var->is_qml_global() ? QmlGlobalObjectOperand():GlobalObjectOperand());
++  __ lw(a0, GlobalObjectOperand());
+   __ li(a2, Operand(var->name()));
+   RelocInfo::Mode mode = (typeof_state == INSIDE_TYPEOF)
+       ? RelocInfo::CODE_TARGET
+@@ -1435,7 +1434,7 @@ void FullCodeGenerator::EmitVariableLoad(VariableProxy* proxy) {
+       Comment cmnt(masm_, "Global variable");
+       // Use inline caching. Variable name is passed in a2 and the global
+       // object (receiver) in a0.
+-      __ lw(a0, var->is_qml_global()?QmlGlobalObjectOperand():GlobalObjectOperand());
++      __ lw(a0, GlobalObjectOperand());
+       __ li(a2, Operand(var->name()));
+       Handle<Code> ic = isolate()->builtins()->LoadIC_Initialize();
+       CallIC(ic, RelocInfo::CODE_TARGET_CONTEXT);
+@@ -2115,7 +2114,7 @@ void FullCodeGenerator::EmitVariableAssignment(Variable* var,
+     // Global var, const, or let.
+     __ mov(a0, result_register());
+     __ li(a2, Operand(var->name()));
+-    __ lw(a1, var->is_qml_global()?QmlGlobalObjectOperand():GlobalObjectOperand());
++    __ lw(a1, GlobalObjectOperand());
+     Handle<Code> ic = is_classic_mode()
+         ? isolate()->builtins()->StoreIC_Initialize()
+         : isolate()->builtins()->StoreIC_Initialize_Strict();
+@@ -2389,12 +2388,8 @@ void FullCodeGenerator::EmitResolvePossiblyDirectEval(int arg_count) {
+   __ li(a1, Operand(Smi::FromInt(scope()->start_position())));
+   __ push(a1);
+ 
+-  // Push the qml mode flag.
+-  __ li(a1, Operand(Smi::FromInt(is_qml_mode())));
+-  __ push(a1);
+-
+   // Do the runtime call.
+-  __ CallRuntime(Runtime::kResolvePossiblyDirectEval, 6);
++  __ CallRuntime(Runtime::kResolvePossiblyDirectEval, 5);
+ }
+ 
+ 
+@@ -2450,7 +2445,7 @@ void FullCodeGenerator::VisitCall(Call* expr) {
+     context()->DropAndPlug(1, v0);
+   } else if (proxy != NULL && proxy->var()->IsUnallocated()) {
+     // Push global object as receiver for the call IC.
+-    __ lw(a0, proxy->var()->is_qml_global()?QmlGlobalObjectOperand():GlobalObjectOperand());
++    __ lw(a0, GlobalObjectOperand());
+     __ push(a0);
+     EmitCallWithIC(expr, proxy->name(), RelocInfo::CODE_TARGET_CONTEXT);
+   } else if (proxy != NULL && proxy->var()->IsLookupSlot()) {
+@@ -3889,7 +3884,7 @@ void FullCodeGenerator::VisitUnaryOperation(UnaryOperation* expr) {
+         // but "delete this" is allowed.
+         ASSERT(language_mode() == CLASSIC_MODE || var->is_this());
+         if (var->IsUnallocated()) {
+-          __ lw(a2, var->is_qml_global() ? QmlGlobalObjectOperand() : GlobalObjectOperand());
++          __ lw(a2, GlobalObjectOperand());
+           __ li(a1, Operand(var->name()));
+           __ li(a0, Operand(Smi::FromInt(kNonStrictMode)));
+           __ Push(a2, a1, a0);
+@@ -4196,7 +4191,7 @@ void FullCodeGenerator::VisitForTypeofValue(Expression* expr) {
+   VariableProxy* proxy = expr->AsVariableProxy();
+   if (proxy != NULL && proxy->var()->IsUnallocated()) {
+     Comment cmnt(masm_, "Global variable");
+-    __ lw(a0, proxy->var()->is_qml_global() ? QmlGlobalObjectOperand() : GlobalObjectOperand());
++    __ lw(a0, GlobalObjectOperand());
+     __ li(a2, Operand(proxy->name()));
+     Handle<Code> ic = isolate()->builtins()->LoadIC_Initialize();
+     // Use a regular load, not a contextual load, to avoid a reference
+diff --git a/src/3rdparty/v8/src/mips/ic-mips.cc b/src/3rdparty/v8/src/mips/ic-mips.cc
+index cf70681..b1bd8f1 100644
+--- a/src/3rdparty/v8/src/mips/ic-mips.cc
++++ b/src/3rdparty/v8/src/mips/ic-mips.cc
+@@ -1215,7 +1215,7 @@ static void KeyedStoreGenerateGenericHelper(
+     __ Branch(fast_double, ne, elements_map,
+               Operand(masm->isolate()->factory()->fixed_array_map()));
+   }
+-  // Smi stores don't require further checks.
++ // Smi stores don't require further checks.
+   Label non_smi_value;
+   __ JumpIfNotSmi(value, &non_smi_value);
+ 
+diff --git a/src/3rdparty/v8/src/mips/lithium-codegen-mips.cc b/src/3rdparty/v8/src/mips/lithium-codegen-mips.cc
+index b268fb3..0cf1985 100644
+--- a/src/3rdparty/v8/src/mips/lithium-codegen-mips.cc
++++ b/src/3rdparty/v8/src/mips/lithium-codegen-mips.cc
+@@ -136,15 +136,23 @@ bool LCodeGen::GeneratePrologue() {
+   // function calls.
+   if (!info_->is_classic_mode() || info_->is_native()) {
+     Label ok;
++    Label begin;
++    __ bind(&begin);
+     __ Branch(&ok, eq, t1, Operand(zero_reg));
+ 
+     int receiver_offset = scope()->num_parameters() * kPointerSize;
+     __ LoadRoot(a2, Heap::kUndefinedValueRootIndex);
+     __ sw(a2, MemOperand(sp, receiver_offset));
+     __ bind(&ok);
++    ASSERT_EQ(kSizeOfOptimizedStrictModePrologue, ok.pos() - begin.pos());
+   }
+ 
++  // The following three instructions must remain together and unmodified for
++  // code aging to work properly.
+   __ Push(ra, fp, cp, a1);
++  // Add unused load of ip to ensure prologue sequence is identical for
++  // full-codegen and lithium-codegen.
++  __ LoadRoot(at, Heap::kUndefinedValueRootIndex);
+   __ Addu(fp, sp, Operand(2 * kPointerSize));  // Adj. FP to point to saved FP.
+ 
+   // Reserve space for the stack slots needed by the code.
+@@ -165,13 +173,12 @@ bool LCodeGen::GeneratePrologue() {
+ 
+   // Possibly allocate a local context.
+   int heap_slots = scope()->num_heap_slots() - Context::MIN_CONTEXT_SLOTS;
+-  if (heap_slots > 0 ||
+-      (scope()->is_qml_mode() && scope()->is_global_scope())) {
++  if (heap_slots > 0) {
+     Comment(";;; Allocate local context");
+     // Argument to NewContext is the function, which is in a1.
+     __ push(a1);
+     if (heap_slots <= FastNewContextStub::kMaximumSlots) {
+-      FastNewContextStub stub((heap_slots < 0)?0:heap_slots);
++      FastNewContextStub stub(heap_slots);
+       __ CallStub(&stub);
+     } else {
+       __ CallRuntime(Runtime::kNewFunctionContext, 1);
+@@ -1141,6 +1148,9 @@ void LCodeGen::DoShiftI(LShiftI* instr) {
+     // No need to mask the right operand on MIPS, it is built into the variable
+     // shift instructions.
+     switch (instr->op()) {
++      case Token::ROR:
++        __ Ror(result, left, Operand(ToRegister(right_op)));
++        break;
+       case Token::SAR:
+         __ srav(result, left, ToRegister(right_op));
+         break;
+@@ -1162,6 +1172,13 @@ void LCodeGen::DoShiftI(LShiftI* instr) {
+     int value = ToInteger32(LConstantOperand::cast(right_op));
+     uint8_t shift_count = static_cast<uint8_t>(value & 0x1F);
+     switch (instr->op()) {
++      case Token::ROR:
++          if (shift_count != 0) {
++          __ Ror(result, left, Operand(shift_count));
++        } else {
++          __ Move(result, left);
++        }
++        break;
+       case Token::SAR:
+         if (shift_count != 0) {
+           __ sra(result, left, shift_count);
+@@ -3040,9 +3057,7 @@ void LCodeGen::DoDeclareGlobals(LDeclareGlobals* instr) {
+ 
+ void LCodeGen::DoGlobalObject(LGlobalObject* instr) {
+   Register result = ToRegister(instr->result());
+-  __ lw(result, ContextOperand(cp, instr->qml_global()
+-                                    ? Context::QML_GLOBAL_OBJECT_INDEX
+-                                    : Context::GLOBAL_OBJECT_INDEX));
++  __ lw(result, ContextOperand(cp, Context::GLOBAL_OBJECT_INDEX));
+ }
+ 
+ 
+@@ -3226,22 +3241,19 @@ void LCodeGen::DoMathAbs(LUnaryMathOperation* instr) {
+ void LCodeGen::DoMathFloor(LUnaryMathOperation* instr) {
+   DoubleRegister input = ToDoubleRegister(instr->value());
+   Register result = ToRegister(instr->result());
+-  FPURegister single_scratch = double_scratch0().low();
+   Register scratch1 = scratch0();
+   Register except_flag = ToRegister(instr->temp());
+ 
+   __ EmitFPUTruncate(kRoundToMinusInf,
+-                     single_scratch,
++                     result,
+                      input,
+                      scratch1,
++                     double_scratch0(),
+                      except_flag);
+ 
+   // Deopt if the operation did not succeed.
+   DeoptimizeIf(ne, instr->environment(), except_flag, Operand(zero_reg));
+ 
+-  // Load the result.
+-  __ mfc1(result, single_scratch);
+-
+   if (instr->hydrogen()->CheckFlag(HValue::kBailoutOnMinusZero)) {
+     // Test for -0.
+     Label done;
+@@ -3257,6 +3269,7 @@ void LCodeGen::DoMathFloor(LUnaryMathOperation* instr) {
+ void LCodeGen::DoMathRound(LUnaryMathOperation* instr) {
+   DoubleRegister input = ToDoubleRegister(instr->value());
+   Register result = ToRegister(instr->result());
++  DoubleRegister double_scratch1 = ToDoubleRegister(instr->temp());
+   Register scratch = scratch0();
+   Label done, check_sign_on_zero;
+ 
+@@ -3308,17 +3321,15 @@ void LCodeGen::DoMathRound(LUnaryMathOperation* instr) {
+   }
+ 
+   Register except_flag = scratch;
+-
+   __ EmitFPUTruncate(kRoundToMinusInf,
+-                     double_scratch0().low(),
+-                     double_scratch0(),
+                      result,
++                     double_scratch0(),
++                     at,
++                     double_scratch1,
+                      except_flag);
+ 
+   DeoptimizeIf(ne, instr->environment(), except_flag, Operand(zero_reg));
+ 
+-  __ mfc1(result, double_scratch0().low());
+-
+   if (instr->hydrogen()->CheckFlag(HValue::kBailoutOnMinusZero)) {
+     // Test for -0.
+     __ Branch(&done, ne, result, Operand(zero_reg));
+@@ -4213,7 +4224,7 @@ void LCodeGen::DoDeferredNumberTagI(LInstruction* instr,
+ 
+   if (FLAG_inline_new) {
+     __ LoadRoot(t2, Heap::kHeapNumberMapRootIndex);
+-    __ AllocateHeapNumber(t1, a3, t0, t2, &slow);
++    __ AllocateHeapNumber(t1, a3, t0, t2, &slow, DONT_TAG_RESULT);
+     __ Move(dst, t1);
+     __ Branch(&done);
+   }
+@@ -4227,11 +4238,13 @@ void LCodeGen::DoDeferredNumberTagI(LInstruction* instr,
+   __ StoreToSafepointRegisterSlot(zero_reg, dst);
+   CallRuntimeFromDeferred(Runtime::kAllocateHeapNumber, 0, instr);
+   __ Move(dst, v0);
++  __ Subu(dst, dst, kHeapObjectTag);
+ 
+   // Done. Put the value in dbl_scratch into the value of the allocated heap
+   // number.
+   __ bind(&done);
+-  __ sdc1(dbl_scratch, FieldMemOperand(dst, HeapNumber::kValueOffset));
++  __ sdc1(dbl_scratch, MemOperand(dst, HeapNumber::kValueOffset));
++  __ Addu(dst, dst, kHeapObjectTag);
+   __ StoreToSafepointRegisterSlot(dst, dst);
+ }
+ 
+@@ -4256,12 +4269,16 @@ void LCodeGen::DoNumberTagD(LNumberTagD* instr) {
+   DeferredNumberTagD* deferred = new(zone()) DeferredNumberTagD(this, instr);
+   if (FLAG_inline_new) {
+     __ LoadRoot(scratch, Heap::kHeapNumberMapRootIndex);
+-    __ AllocateHeapNumber(reg, temp1, temp2, scratch, deferred->entry());
++    // We want the untagged address first for performance
++    __ AllocateHeapNumber(reg, temp1, temp2, scratch, deferred->entry(),
++                          DONT_TAG_RESULT);
+   } else {
+     __ Branch(deferred->entry());
+   }
+   __ bind(deferred->exit());
+-  __ sdc1(input_reg, FieldMemOperand(reg, HeapNumber::kValueOffset));
++  __ sdc1(input_reg, MemOperand(reg, HeapNumber::kValueOffset));
++  // Now that we have finished with the object's real address tag it
++  __ Addu(reg, reg, kHeapObjectTag);
+ }
+ 
+ 
+@@ -4274,6 +4291,7 @@ void LCodeGen::DoDeferredNumberTagD(LNumberTagD* instr) {
+ 
+   PushSafepointRegistersScope scope(this, Safepoint::kWithRegisters);
+   CallRuntimeFromDeferred(Runtime::kAllocateHeapNumber, 0, instr);
++  __ Subu(v0, v0, kHeapObjectTag);
+   __ StoreToSafepointRegisterSlot(v0, reg);
+ }
+ 
+@@ -4355,7 +4373,7 @@ void LCodeGen::DoDeferredTaggedToI(LTaggedToI* instr) {
+   Register scratch1 = scratch0();
+   Register scratch2 = ToRegister(instr->temp());
+   DoubleRegister double_scratch = double_scratch0();
+-  FPURegister single_scratch = double_scratch.low();
++  DoubleRegister double_scratch2 = ToDoubleRegister(instr->temp3());
+ 
+   ASSERT(!scratch1.is(input_reg) && !scratch1.is(scratch2));
+   ASSERT(!scratch2.is(input_reg) && !scratch2.is(scratch1));
+@@ -4371,7 +4389,7 @@ void LCodeGen::DoDeferredTaggedToI(LTaggedToI* instr) {
+ 
+   if (instr->truncating()) {
+     Register scratch3 = ToRegister(instr->temp2());
+-    DoubleRegister double_scratch2 = ToDoubleRegister(instr->temp3());
++    FPURegister single_scratch = double_scratch.low();
+     ASSERT(!scratch3.is(input_reg) &&
+            !scratch3.is(scratch1) &&
+            !scratch3.is(scratch2));
+@@ -4406,18 +4424,16 @@ void LCodeGen::DoDeferredTaggedToI(LTaggedToI* instr) {
+ 
+     Register except_flag = scratch2;
+     __ EmitFPUTruncate(kRoundToZero,
+-                       single_scratch,
++                       input_reg,
+                        double_scratch,
+                        scratch1,
++                       double_scratch2,
+                        except_flag,
+                        kCheckForInexactConversion);
+ 
+     // Deopt if the operation did not succeed.
+     DeoptimizeIf(ne, instr->environment(), except_flag, Operand(zero_reg));
+ 
+-    // Load the result.
+-    __ mfc1(input_reg, single_scratch);
+-
+     if (instr->hydrogen()->CheckFlag(HValue::kBailoutOnMinusZero)) {
+       __ Branch(&done, ne, input_reg, Operand(zero_reg));
+ 
+@@ -4479,10 +4495,10 @@ void LCodeGen::DoDoubleToI(LDoubleToI* instr) {
+   Register scratch1 = scratch0();
+   Register scratch2 = ToRegister(instr->temp());
+   DoubleRegister double_input = ToDoubleRegister(instr->value());
+-  FPURegister single_scratch = double_scratch0().low();
+ 
+   if (instr->truncating()) {
+     Register scratch3 = ToRegister(instr->temp2());
++    FPURegister single_scratch = double_scratch0().low();
+     __ EmitECMATruncate(result_reg,
+                         double_input,
+                         single_scratch,
+@@ -4493,17 +4509,15 @@ void LCodeGen::DoDoubleToI(LDoubleToI* instr) {
+     Register except_flag = scratch2;
+ 
+     __ EmitFPUTruncate(kRoundToMinusInf,
+-                       single_scratch,
++                       result_reg,
+                        double_input,
+                        scratch1,
++                       double_scratch0(),
+                        except_flag,
+                        kCheckForInexactConversion);
+ 
+     // Deopt if the operation did not succeed (except_flag != 0).
+     DeoptimizeIf(ne, instr->environment(), except_flag, Operand(zero_reg));
+-
+-    // Load the result.
+-    __ mfc1(result_reg, single_scratch);
+   }
+ }
+ 
+diff --git a/src/3rdparty/v8/src/mips/lithium-mips.cc b/src/3rdparty/v8/src/mips/lithium-mips.cc
+index 7b71758..066bf41 100644
+--- a/src/3rdparty/v8/src/mips/lithium-mips.cc
++++ b/src/3rdparty/v8/src/mips/lithium-mips.cc
+@@ -177,6 +177,7 @@ const char* LArithmeticT::Mnemonic() const {
+     case Token::BIT_AND: return "bit-and-t";
+     case Token::BIT_OR: return "bit-or-t";
+     case Token::BIT_XOR: return "bit-xor-t";
++    case Token::ROR: return "ror-t";
+     case Token::SHL: return "sll-t";
+     case Token::SAR: return "sra-t";
+     case Token::SHR: return "srl-t";
+@@ -992,7 +993,7 @@ LInstruction* LChunkBuilder::DoDeclareGlobals(HDeclareGlobals* instr) {
+ 
+ LInstruction* LChunkBuilder::DoGlobalObject(HGlobalObject* instr) {
+   LOperand* context = UseRegisterAtStart(instr->value());
+-  return DefineAsRegister(new(zone()) LGlobalObject(context, instr->qml_global()));
++  return DefineAsRegister(new(zone()) LGlobalObject(context));
+ }
+ 
+ 
+@@ -1032,7 +1033,9 @@ LInstruction* LChunkBuilder::DoUnaryMathOperation(HUnaryMathOperation* instr) {
+     return DefineFixedDouble(result, f4);
+   } else {
+     LOperand* input = UseRegisterAtStart(instr->value());
+-    LOperand* temp = (op == kMathFloor) ? TempRegister() : NULL;
++
++    LOperand* temp = (op == kMathRound) ? FixedTemp(f6) :
++        (op == kMathFloor) ? TempRegister() : NULL;
+     LUnaryMathOperation* result = new(zone()) LUnaryMathOperation(input, temp);
+     switch (op) {
+       case kMathAbs:
+@@ -1067,7 +1070,7 @@ LInstruction* LChunkBuilder::DoCallNamed(HCallNamed* instr) {
+ 
+ LInstruction* LChunkBuilder::DoCallGlobal(HCallGlobal* instr) {
+   argument_count_ -= instr->argument_count();
+-  return MarkAsCall(DefineFixed(new(zone()) LCallGlobal(instr->qml_global()), v0), instr);
++  return MarkAsCall(DefineFixed(new(zone()) LCallGlobal, v0), instr);
+ }
+ 
+ 
+@@ -1099,6 +1102,11 @@ LInstruction* LChunkBuilder::DoCallRuntime(HCallRuntime* instr) {
+ }
+ 
+ 
++LInstruction* LChunkBuilder::DoRor(HRor* instr) {
++  return DoShift(Token::ROR, instr);
++}
++
++
+ LInstruction* LChunkBuilder::DoShr(HShr* instr) {
+   return DoShift(Token::SHR, instr);
+ }
+@@ -1544,8 +1552,7 @@ LInstruction* LChunkBuilder::DoChange(HChange* instr) {
+         LOperand* temp1 = TempRegister();
+         LOperand* temp2 = instr->CanTruncateToInt32() ? TempRegister()
+                                                       : NULL;
+-        LOperand* temp3 = instr->CanTruncateToInt32() ? FixedTemp(f22)
+-                                                      : NULL;
++        LOperand* temp3 = FixedTemp(f22);
+         res = DefineSameAsFirst(new(zone()) LTaggedToI(value,
+                                                        temp1,
+                                                        temp2,
+diff --git a/src/3rdparty/v8/src/mips/lithium-mips.h b/src/3rdparty/v8/src/mips/lithium-mips.h
+index 00e21fd..3ea0aef 100644
+--- a/src/3rdparty/v8/src/mips/lithium-mips.h
++++ b/src/3rdparty/v8/src/mips/lithium-mips.h
+@@ -1522,19 +1522,13 @@ class LDeclareGlobals: public LTemplateInstruction<0, 0, 0> {
+ 
+ class LGlobalObject: public LTemplateInstruction<1, 1, 0> {
+  public:
+-  explicit LGlobalObject(LOperand* context, bool qml_global) {
++  explicit LGlobalObject(LOperand* context) {
+     inputs_[0] = context;
+-    qml_global_ = qml_global;
+   }
+ 
+   LOperand* context() { return inputs_[0]; }
+ 
+   DECLARE_CONCRETE_INSTRUCTION(GlobalObject, "global-object")
+-
+-  bool qml_global() { return qml_global_; }
+-
+- private:
+-  bool qml_global_;
+ };
+ 
+ 
+@@ -1630,16 +1624,10 @@ class LCallGlobal: public LTemplateInstruction<1, 0, 0> {
+   DECLARE_CONCRETE_INSTRUCTION(CallGlobal, "call-global")
+   DECLARE_HYDROGEN_ACCESSOR(CallGlobal)
+ 
+-  explicit LCallGlobal(bool qml_global) : qml_global_(qml_global) {}
+-
+   virtual void PrintDataTo(StringStream* stream);
+ 
+   Handle<String> name() const {return hydrogen()->name(); }
+   int arity() const { return hydrogen()->argument_count() - 1; }
+-
+-  bool qml_global() { return qml_global_; }
+- private:
+-  bool qml_global_;
+ };
+ 
+ 
+diff --git a/src/3rdparty/v8/src/mips/macro-assembler-mips.cc b/src/3rdparty/v8/src/mips/macro-assembler-mips.cc
+index aebfe73..3e9ade9 100644
+--- a/src/3rdparty/v8/src/mips/macro-assembler-mips.cc
++++ b/src/3rdparty/v8/src/mips/macro-assembler-mips.cc
+@@ -488,6 +488,10 @@ void MacroAssembler::LoadFromNumberDictionary(Label* miss,
+   Label done;
+ 
+   GetNumberHash(reg0, reg1);
++  sll(reg1, reg0, 11);
++  sll(at, reg0, 3);
++  addu(reg0, reg0, at);
++  addu(reg0, reg0, reg1);
+ 
+   // Compute the capacity mask.
+   lw(reg1, FieldMemOperand(elements, SeededNumberDictionary::kCapacityOffset));
+@@ -1395,49 +1399,68 @@ void MacroAssembler::ConvertToInt32(Register source,
+ 
+ 
+ void MacroAssembler::EmitFPUTruncate(FPURoundingMode rounding_mode,
+-                                     FPURegister result,
++                                     Register result,
+                                      DoubleRegister double_input,
+-                                     Register scratch1,
++                                     Register scratch,
++                                     DoubleRegister double_scratch,
+                                      Register except_flag,
+                                      CheckForInexactConversion check_inexact) {
++  ASSERT(!result.is(scratch));
++  ASSERT(!double_input.is(double_scratch));
++  ASSERT(!except_flag.is(scratch));
++
+   ASSERT(CpuFeatures::IsSupported(FPU));
+   CpuFeatures::Scope scope(FPU);
++  Label done;
++
++  // Clear the except flag (0 = no exception)
++  mov(except_flag, zero_reg);
++
++  // Test for values that can be exactly represented as a signed 32-bit integer.
++  cvt_w_d(double_scratch, double_input);
++  mfc1(result, double_scratch);
++  cvt_d_w(double_scratch, double_scratch);
++  BranchF(&done, NULL, eq, double_input, double_scratch);
+ 
+   int32_t except_mask = kFCSRFlagMask;  // Assume interested in all exceptions.
+ 
+   if (check_inexact == kDontCheckForInexactConversion) {
+-    // Ingore inexact exceptions.
++    // Ignore inexact exceptions.
+     except_mask &= ~kFCSRInexactFlagMask;
+   }
+ 
+   // Save FCSR.
+-  cfc1(scratch1, FCSR);
++  cfc1(scratch, FCSR);
+   // Disable FPU exceptions.
+   ctc1(zero_reg, FCSR);
+ 
+   // Do operation based on rounding mode.
+   switch (rounding_mode) {
+     case kRoundToNearest:
+-      Round_w_d(result, double_input);
++      Round_w_d(double_scratch, double_input);
+       break;
+     case kRoundToZero:
+-      Trunc_w_d(result, double_input);
++      Trunc_w_d(double_scratch, double_input);
+       break;
+     case kRoundToPlusInf:
+-      Ceil_w_d(result, double_input);
++      Ceil_w_d(double_scratch, double_input);
+       break;
+     case kRoundToMinusInf:
+-      Floor_w_d(result, double_input);
++      Floor_w_d(double_scratch, double_input);
+       break;
+   }  // End of switch-statement.
+ 
+   // Retrieve FCSR.
+   cfc1(except_flag, FCSR);
+   // Restore FCSR.
+-  ctc1(scratch1, FCSR);
++  ctc1(scratch, FCSR);
++  // Move the converted value into the result register.
++  mfc1(result, double_scratch);
+ 
+   // Check for fpu exceptions.
+   And(except_flag, except_flag, Operand(except_mask));
++
++  bind(&done);
+ }
+ 
+ 
+@@ -3215,7 +3238,8 @@ void MacroAssembler::AllocateHeapNumber(Register result,
+                                         Register scratch1,
+                                         Register scratch2,
+                                         Register heap_number_map,
+-                                        Label* need_gc) {
++                                        Label* need_gc,
++                                        TaggingMode tagging_mode) {
+   // Allocate an object in the heap for the heap number and tag it as a heap
+   // object.
+   AllocateInNewSpace(HeapNumber::kSize,
+@@ -3223,11 +3247,16 @@ void MacroAssembler::AllocateHeapNumber(Register result,
+                      scratch1,
+                      scratch2,
+                      need_gc,
+-                     TAG_OBJECT);
++                     tagging_mode == TAG_RESULT ? TAG_OBJECT :
++                                                  NO_ALLOCATION_FLAGS);
+ 
+   // Store heap number map in the allocated object.
+   AssertRegisterIsRoot(heap_number_map, Heap::kHeapNumberMapRootIndex);
+-  sw(heap_number_map, FieldMemOperand(result, HeapObject::kMapOffset));
++  if (tagging_mode == TAG_RESULT) {
++    sw(heap_number_map, FieldMemOperand(result, HeapObject::kMapOffset));
++  } else {
++    sw(heap_number_map, MemOperand(result, HeapObject::kMapOffset));
++  }
+ }
+ 
+ 
+diff --git a/src/3rdparty/v8/src/mips/macro-assembler-mips.h b/src/3rdparty/v8/src/mips/macro-assembler-mips.h
+index 8b7d7c1..f3c13b1 100644
+--- a/src/3rdparty/v8/src/mips/macro-assembler-mips.h
++++ b/src/3rdparty/v8/src/mips/macro-assembler-mips.h
+@@ -65,6 +65,14 @@ enum AllocationFlags {
+   SIZE_IN_WORDS = 1 << 2
+ };
+ 
++// Flags used for AllocateHeapNumber
++enum TaggingMode {
++  // Tag the result.
++  TAG_RESULT,
++  // Don't tag
++  DONT_TAG_RESULT
++};
++
+ // Flags used for the ObjectToDoubleFPURegister function.
+ enum ObjectToDoubleFlags {
+   // No special flags.
+@@ -112,11 +120,6 @@ inline MemOperand GlobalObjectOperand()  {
+ }
+ 
+ 
+-static inline MemOperand QmlGlobalObjectOperand()  {
+-  return ContextOperand(cp, Context::QML_GLOBAL_OBJECT_INDEX);
+-}
+-
+-
+ // Generate a MemOperand for loading a field from an object.
+ inline MemOperand FieldMemOperand(Register object, int offset) {
+   return MemOperand(object, offset - kHeapObjectTag);
+@@ -541,7 +544,8 @@ class MacroAssembler: public Assembler {
+                           Register scratch1,
+                           Register scratch2,
+                           Register heap_number_map,
+-                          Label* gc_required);
++                          Label* gc_required,
++                          TaggingMode tagging_mode = TAG_RESULT);
+   void AllocateHeapNumberWithValue(Register result,
+                                    FPURegister value,
+                                    Register scratch1,
+@@ -757,14 +761,16 @@ class MacroAssembler: public Assembler {
+                       FPURegister double_scratch,
+                       Label *not_int32);
+ 
+-  // Truncates a double using a specific rounding mode.
++  // Truncates a double using a specific rounding mode, and writes the value
++  // to the result register.
+   // The except_flag will contain any exceptions caused by the instruction.
+-  // If check_inexact is kDontCheckForInexactConversion, then the inexacat
++  // If check_inexact is kDontCheckForInexactConversion, then the inexact
+   // exception is masked.
+   void EmitFPUTruncate(FPURoundingMode rounding_mode,
+-                       FPURegister result,
++                       Register result,
+                        DoubleRegister double_input,
+-                       Register scratch1,
++                       Register scratch,
++                       DoubleRegister double_scratch,
+                        Register except_flag,
+                        CheckForInexactConversion check_inexact
+                            = kDontCheckForInexactConversion);
+diff --git a/src/3rdparty/v8/src/mips/stub-cache-mips.cc b/src/3rdparty/v8/src/mips/stub-cache-mips.cc
+index bd15775..3113976 100644
+--- a/src/3rdparty/v8/src/mips/stub-cache-mips.cc
++++ b/src/3rdparty/v8/src/mips/stub-cache-mips.cc
+@@ -3654,6 +3654,7 @@ static void GenerateSmiKeyCheck(MacroAssembler* masm,
+                                 Register scratch0,
+                                 Register scratch1,
+                                 FPURegister double_scratch0,
++                                FPURegister double_scratch1,
+                                 Label* fail) {
+   if (CpuFeatures::IsSupported(FPU)) {
+     CpuFeatures::Scope scope(FPU);
+@@ -3669,15 +3670,15 @@ static void GenerateSmiKeyCheck(MacroAssembler* masm,
+                 DONT_DO_SMI_CHECK);
+     __ ldc1(double_scratch0, FieldMemOperand(key, HeapNumber::kValueOffset));
+     __ EmitFPUTruncate(kRoundToZero,
+-                       double_scratch0,
+-                       double_scratch0,
+                        scratch0,
++                       double_scratch0,
++                       at,
++                       double_scratch1,
+                        scratch1,
+                        kCheckForInexactConversion);
+ 
+     __ Branch(fail, ne, scratch1, Operand(zero_reg));
+ 
+-    __ mfc1(scratch0, double_scratch0);
+     __ SmiTagCheckOverflow(key, scratch0, scratch1);
+     __ BranchOnOverflow(fail, scratch1);
+     __ bind(&key_ok);
+@@ -3705,7 +3706,7 @@ void KeyedLoadStubCompiler::GenerateLoadExternalArray(
+   // have been verified by the caller to not be a smi.
+ 
+   // Check that the key is a smi or a heap number convertible to a smi.
+-  GenerateSmiKeyCheck(masm, key, t0, t1, f2, &miss_force_generic);
++  GenerateSmiKeyCheck(masm, key, t0, t1, f2, f4, &miss_force_generic);
+ 
+   __ lw(a3, FieldMemOperand(receiver, JSObject::kElementsOffset));
+   // a3: elements array
+@@ -3805,20 +3806,27 @@ void KeyedLoadStubCompiler::GenerateLoadExternalArray(
+     __ Ret();
+ 
+     __ bind(&box_int);
+-    // Allocate a HeapNumber for the result and perform int-to-double
+-    // conversion.
+-    // The arm version uses a temporary here to save r0, but we don't need to
+-    // (a0 is not modified).
+-    __ LoadRoot(t1, Heap::kHeapNumberMapRootIndex);
+-    __ AllocateHeapNumber(v0, a3, t0, t1, &slow);
+ 
+     if (CpuFeatures::IsSupported(FPU)) {
+       CpuFeatures::Scope scope(FPU);
++      // Allocate a HeapNumber for the result and perform int-to-double
++      // conversion.
++      // The arm version uses a temporary here to save r0, but we don't need to
++      // (a0 is not modified).
++      __ LoadRoot(t1, Heap::kHeapNumberMapRootIndex);
++      __ AllocateHeapNumber(v0, a3, t0, t1, &slow, DONT_TAG_RESULT);
+       __ mtc1(value, f0);
+       __ cvt_d_w(f0, f0);
+-      __ sdc1(f0, FieldMemOperand(v0, HeapNumber::kValueOffset));
++      __ sdc1(f0, MemOperand(v0, HeapNumber::kValueOffset));
++      __ Addu(v0, v0, kHeapObjectTag);
+       __ Ret();
+     } else {
++      // Allocate a HeapNumber for the result and perform int-to-double
++      // conversion.
++      // The arm version uses a temporary here to save r0, but we don't need to
++      // (a0 is not modified).
++      __ LoadRoot(t1, Heap::kHeapNumberMapRootIndex);
++      __ AllocateHeapNumber(v0, a3, t0, t1, &slow, TAG_RESULT);
+       Register dst1 = t2;
+       Register dst2 = t3;
+       FloatingPointHelper::Destination dest =
+@@ -3855,7 +3863,7 @@ void KeyedLoadStubCompiler::GenerateLoadExternalArray(
+       // conversion. Don't use a0 and a1 as AllocateHeapNumber clobbers all
+       // registers - also when jumping due to exhausted young space.
+       __ LoadRoot(t6, Heap::kHeapNumberMapRootIndex);
+-      __ AllocateHeapNumber(v0, t2, t3, t6, &slow);
++      __ AllocateHeapNumber(v0, t2, t3, t6, &slow, DONT_TAG_RESULT);
+ 
+       // This is replaced by a macro:
+       // __ mtc1(value, f0);     // LS 32-bits.
+@@ -3864,8 +3872,9 @@ void KeyedLoadStubCompiler::GenerateLoadExternalArray(
+ 
+       __ Cvt_d_uw(f0, value, f22);
+ 
+-      __ sdc1(f0, FieldMemOperand(v0, HeapNumber::kValueOffset));
++      __ sdc1(f0, MemOperand(v0, HeapNumber::kValueOffset));
+ 
++      __ Addu(v0, v0, kHeapObjectTag);
+       __ Ret();
+     } else {
+       // Check whether unsigned integer fits into smi.
+@@ -3898,7 +3907,7 @@ void KeyedLoadStubCompiler::GenerateLoadExternalArray(
+       // clobbers all registers - also when jumping due to exhausted young
+       // space.
+       __ LoadRoot(t6, Heap::kHeapNumberMapRootIndex);
+-      __ AllocateHeapNumber(t2, t3, t5, t6, &slow);
++      __ AllocateHeapNumber(t2, t3, t5, t6, &slow, TAG_RESULT);
+ 
+       __ sw(hiword, FieldMemOperand(t2, HeapNumber::kExponentOffset));
+       __ sw(loword, FieldMemOperand(t2, HeapNumber::kMantissaOffset));
+@@ -3915,17 +3924,19 @@ void KeyedLoadStubCompiler::GenerateLoadExternalArray(
+       // AllocateHeapNumber clobbers all registers - also when jumping due to
+       // exhausted young space.
+       __ LoadRoot(t6, Heap::kHeapNumberMapRootIndex);
+-      __ AllocateHeapNumber(v0, t3, t5, t6, &slow);
++      __ AllocateHeapNumber(v0, t3, t5, t6, &slow, DONT_TAG_RESULT);
+       // The float (single) value is already in fpu reg f0 (if we use float).
+       __ cvt_d_s(f0, f0);
+-      __ sdc1(f0, FieldMemOperand(v0, HeapNumber::kValueOffset));
++      __ sdc1(f0, MemOperand(v0, HeapNumber::kValueOffset));
++
++      __ Addu(v0, v0, kHeapObjectTag);
+       __ Ret();
+     } else {
+       // Allocate a HeapNumber for the result. Don't use a0 and a1 as
+       // AllocateHeapNumber clobbers all registers - also when jumping due to
+       // exhausted young space.
+       __ LoadRoot(t6, Heap::kHeapNumberMapRootIndex);
+-      __ AllocateHeapNumber(v0, t3, t5, t6, &slow);
++      __ AllocateHeapNumber(v0, t3, t5, t6, &slow, TAG_RESULT);
+       // FPU is not available, do manual single to double conversion.
+ 
+       // a2: floating point value (binary32).
+@@ -3980,16 +3991,18 @@ void KeyedLoadStubCompiler::GenerateLoadExternalArray(
+       // AllocateHeapNumber clobbers all registers - also when jumping due to
+       // exhausted young space.
+       __ LoadRoot(t6, Heap::kHeapNumberMapRootIndex);
+-      __ AllocateHeapNumber(v0, t3, t5, t6, &slow);
++      __ AllocateHeapNumber(v0, t3, t5, t6, &slow, DONT_TAG_RESULT);
+       // The double value is already in f0
+-      __ sdc1(f0, FieldMemOperand(v0, HeapNumber::kValueOffset));
++      __ sdc1(f0, MemOperand(v0, HeapNumber::kValueOffset));
++
++      __ Addu(v0, v0, kHeapObjectTag);
+       __ Ret();
+     } else {
+       // Allocate a HeapNumber for the result. Don't use a0 and a1 as
+       // AllocateHeapNumber clobbers all registers - also when jumping due to
+       // exhausted young space.
+       __ LoadRoot(t6, Heap::kHeapNumberMapRootIndex);
+-      __ AllocateHeapNumber(v0, t3, t5, t6, &slow);
++      __ AllocateHeapNumber(v0, t3, t5, t6, &slow, TAG_RESULT);
+ 
+       __ sw(a2, FieldMemOperand(v0, HeapNumber::kMantissaOffset));
+       __ sw(a3, FieldMemOperand(v0, HeapNumber::kExponentOffset));
+@@ -4047,7 +4060,7 @@ void KeyedStoreStubCompiler::GenerateStoreExternalArray(
+   // have been verified by the caller to not be a smi.
+ 
+   // Check that the key is a smi or a heap number convertible to a smi.
+-  GenerateSmiKeyCheck(masm, key, t0, t1, f2, &miss_force_generic);
++  GenerateSmiKeyCheck(masm, key, t0, t1, f2, f4, &miss_force_generic);
+ 
+   __ lw(a3, FieldMemOperand(receiver, JSObject::kElementsOffset));
+ 
+@@ -4436,7 +4449,7 @@ void KeyedLoadStubCompiler::GenerateLoadFastElement(MacroAssembler* masm) {
+   // have been verified by the caller to not be a smi.
+ 
+   // Check that the key is a smi or a heap number convertible to a smi.
+-  GenerateSmiKeyCheck(masm, a0, t0, t1, f2, &miss_force_generic);
++  GenerateSmiKeyCheck(masm, a0, t0, t1, f2, f4, &miss_force_generic);
+ 
+   // Get the elements array.
+   __ lw(a2, FieldMemOperand(a1, JSObject::kElementsOffset));
+@@ -4487,7 +4500,7 @@ void KeyedLoadStubCompiler::GenerateLoadFastDoubleElement(
+   // have been verified by the caller to not be a smi.
+ 
+   // Check that the key is a smi or a heap number convertible to a smi.
+-  GenerateSmiKeyCheck(masm, key_reg, t0, t1, f2, &miss_force_generic);
++  GenerateSmiKeyCheck(masm, key_reg, t0, t1, f2, f4, &miss_force_generic);
+ 
+   // Get the elements array.
+   __ lw(elements_reg,
+@@ -4507,7 +4520,7 @@ void KeyedLoadStubCompiler::GenerateLoadFastDoubleElement(
+   // Non-NaN. Allocate a new heap number and copy the double value into it.
+   __ LoadRoot(heap_number_map, Heap::kHeapNumberMapRootIndex);
+   __ AllocateHeapNumber(heap_number_reg, scratch2, scratch3,
+-                        heap_number_map, &slow_allocate_heapnumber);
++                        heap_number_map, &slow_allocate_heapnumber, TAG_RESULT);
+ 
+   // Don't need to reload the upper 32 bits of the double, it's already in
+   // scratch.
+@@ -4561,7 +4574,7 @@ void KeyedStoreStubCompiler::GenerateStoreFastElement(
+   // have been verified by the caller to not be a smi.
+ 
+   // Check that the key is a smi or a heap number convertible to a smi.
+-  GenerateSmiKeyCheck(masm, key_reg, t0, t1, f2, &miss_force_generic);
++  GenerateSmiKeyCheck(masm, key_reg, t0, t1, f2, f4, &miss_force_generic);
+ 
+   if (IsFastSmiElementsKind(elements_kind)) {
+     __ JumpIfNotSmi(value_reg, &transition_elements_kind);
+@@ -4728,7 +4741,7 @@ void KeyedStoreStubCompiler::GenerateStoreFastDoubleElement(
+   // have been verified by the caller to not be a smi.
+ 
+   // Check that the key is a smi or a heap number convertible to a smi.
+-  GenerateSmiKeyCheck(masm, key_reg, t0, t1, f2, &miss_force_generic);
++  GenerateSmiKeyCheck(masm, key_reg, t0, t1, f2, f4, &miss_force_generic);
+ 
+   __ lw(elements_reg,
+          FieldMemOperand(receiver_reg, JSObject::kElementsOffset));

@@ -1,13 +1,16 @@
 #!/bin/bash
 
+N_THREADS=8
+
 usage() {
     echo -e "usage: $0 -c <arch> [-d <path to compile in> | -g | -b | -m] | [-h]\n\
 -c <arch> : set the architecture to (cross) build\n\
 -d <path> : set path of q5 build directory\n\
 -g : skip git fetch\n\
 -b : skip compiling qt5 base\n\
--m : skip compilng qt modules" 
-    exit 1
+-m : skip compilng qt modules\n\
+-j # : builds with # threads (default is $N_THREADS)."
+    exit 0
 }
 
 while [ $# -gt 0 ] ; do
@@ -29,7 +32,12 @@ while [ $# -gt 0 ] ; do
         -m)
             skip_modules=1
             ;;
-        *) 
+        -j)
+            shift 1
+            echo "[$0] Building with $1 threads."
+            N_THREADS=$1
+            ;;
+        *)
             usage
             ;;
     esac
@@ -62,29 +70,23 @@ export QTDIR=$NEW_QTDIR
 export PATH=$QTDIR/bin:$PATH
 
 MIRROR_URL="git://gitorious.org"
+BRANCH=stable
+THREADS=
+if [ $N_THREADS -gt 1 ]; then
+    THREADS=-j$N_THREADS
+fi
 
 if [ -z $skip_git ]; then
     echo "removing: $NEW_QTDIR"
     rm -rf $NEW_QTDIR
-    #rm -rf $QTDIR_PATH/qt5
-    #git clone git@gitorious.org:+qt-developers/qt/qt5.git || exit 1
-    #git clone git://gitorious.org/qt/qt5.git || exit 1
-    echo "cloning qtsdk..."
-    if [ ! -d qtsdk ]; then
-        git clone -b master $MIRROR_URL"/qtsdk/qtsdk.git" qtsdk || exit 1
+    echo "cloning qt5..."
+    if [ ! -d qt5 ]; then
+        git clone -b $BRANCH $MIRROR_URL"/qt/qt5.git" qt5 || exit 1
     fi
-
-    for module in $NON_QT5_MODULES; do
-        echo "cloning qtsdk module: $module ..."
-        if [ ! -d qtsdk/$module ]; then
-            module_branch="${module}_BRANCH"
-            git clone -b ${!module_branch} $MIRROR_URL"/qt/"$module".git" qtsdk/$module
-        fi
-    done
 fi
 
-echo "entering: $QTDIR_PATH/qtsdk"
-cd $QTDIR_PATH/qtsdk
+echo "entering: $QTDIR_PATH/qt5"
+cd $QTDIR_PATH/qt5
 
 if [ -z $skip_git ]; then
     echo "Setting up git"
@@ -102,17 +104,6 @@ if [ -z $skip_git ]; then
     echo ==========================================================
     git submodule status
     echo ==========================================================
-
-    for module in $NON_QT5_MODULES
-    do
-        module_hash="${module}_HASH"
-        module_branch="${module}_BRANCH"
-        cd $module && git checkout ${!module_branch} && git clean -dxf && git reset --hard HEAD && git fetch && git checkout ${!module_hash} && cd ..
-        if [ $? -ne 0 ] ; then
-            echo FAIL: updating $module
-            exit 1
-        fi
-    done
 fi
 
 echo "sourcing $ARCH specific script file."
